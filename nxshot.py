@@ -8,9 +8,10 @@ from shutil import copy
 from Crypto.Cipher import AES
 from Crypto.Util import Padding
 import hashlib
-from urllib.request import urlopen
+from urllib.request import urlopen, urlretrieve
 from urllib.error import URLError
 from bs4 import BeautifulSoup
+import xml.etree.ElementTree as ET
 
 keyhash = "24e0dc62a15c11d38b622162ea2b4383"
 updated = 0
@@ -26,6 +27,13 @@ parser.add_argument(
     metavar='FILEPATH',
     type=Path,
     help='"Nintendo/Album" folder from your SD card.')
+
+parser.add_argument('-d',
+    '--download-nswdb',
+    action='store_true',
+    help='Download IDs from nswdb.com instead of switchbrew.org\n \
+          NOTE: Regions may not match SwitchBrew')
+
 
 # If there are arguments, parse them. If not, exit
 args = parser.parse_args()
@@ -45,11 +53,37 @@ def loadKey(filename, keyhash):
         print("Decryption key (key.txt) doesn't match!")
 
 
+def decryptTitleID(key, titleid):
+    cipher = AES.new(key, AES.MODE_ECB)
+
+    titleidb = bytes.fromhex(titleid)
+    titleidb = titleidb[7::-1]
+    conversion = titleidb.hex()
+    conversion = conversion.ljust(32, '0')
+    titleidb = bytes.fromhex(conversion)
+    encrypted = cipher.encrypt(titleidb)
+    screenshotid = encrypted.hex().upper()
+
+    return screenshotid
+
+
 def updateGameIDs():
     key = loadKey('key.txt', keyhash)
     if not key:
         return -1
 
+    if args.download_nswdb:
+        updateNSWDB(key)
+    else:
+        updateSwitchBrew(key)
+
+    with open('gameids.json', 'w', encoding='utf-8') as idfile:
+            json.dump(idname, idfile, ensure_ascii=False, indent=4, sort_keys=True)
+            print("Successfully updated Game IDs")
+
+    return 1
+
+def updateSwitchBrew(key):
     wiki = 'http://switchbrew.org/index.php?title=Title_list/Games'
     try:
         wikipage = urlopen(wiki)
@@ -61,13 +95,11 @@ def updateGameIDs():
     gametable = wikisoup.find('table', {"class" : "wikitable sortable" })
     gametabler = gametable.find_all('tr')
 
-    cipher = AES.new(key, AES.MODE_ECB)
-
     for row in gametabler[1:]:
         try:
-            titleid = row.contents[1].contents[0][0:]
-            gamename = row.contents[3].contents[0][0:]
-            region = row.contents[5].contents[0][0:]
+            titleid = row.contents[1].contents[0]
+            gamename = row.contents[3].contents[0]
+            region = row.contents[5].contents[0]
         except IndexError: # At least one cell empty; ignore row
             continue
 
@@ -75,24 +107,33 @@ def updateGameIDs():
             gamename = gamename.replace(":", " -")
 
         #print('TitleID = {}'.format(titleid))
-
-        titleidb = bytes.fromhex(titleid)
-        titleidb = titleidb[7::-1]
-        conversion = titleidb.hex()
-        conversion = conversion.ljust(32, '0')
-        titleidb = bytes.fromhex(conversion)
-        encrypted = cipher.encrypt(titleidb)
-        screenshotid = encrypted.hex().upper()
+        screenshotid = decryptTitleID(key, titleid)
 
         #print("ScreenshotID = {}".format(encrypted.hex()))
         idname[screenshotid] = gamename + ' (' + region + ')'
 
-    with open('gameids.json', 'w', encoding='utf-8') as idfile:
-            json.dump(idname, idfile, ensure_ascii=False, indent=4, sort_keys=True)
-            print("Successfully updated Game IDs")
 
-    return 1
+def updateNSWDB(key):
+    urlretrieve('http://nswdb.com/xml.php', 'db.xml')
+    tree = ET.parse('db.xml')
+    root = tree.getroot()
 
+    for release in root.findall('release'):
+        try:
+            screenshotid = decryptTitleID(key, release.find('titleid').text)
+
+            region = release.find('region').text
+            if region == "WLD":
+                region = "EUR USA"
+
+            name = release.find('name').text
+            name = name.replace(":", " -")
+        except ValueError:
+            continue
+
+        idname[screenshotid] = name + ' (' + region + ')'
+
+    os.remove("db.xml")
 
 
 def checkID(gameid, idname):
@@ -145,7 +186,8 @@ def checkFolders(filelist):
 
         current += 1
 
-        print('Organized {} of {} files.'.format(current, length))
+        print('Organized {} of {} files.\r'.format(current, length), end='')
+    print("")
 
 
 # Load game ids and their names from external file
